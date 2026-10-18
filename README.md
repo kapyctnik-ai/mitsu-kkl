@@ -111,6 +111,13 @@ listen-only K-line recorder ([pico/sniffer.py](pico/sniffer.py)): every edge of 
 with 1 µs resolution, decoded into 5-baud init frames (address, bit time) and bytes at 15625 / 10400 /
 9600 / 1953 baud. `tools/sniff_ch340.py` does a simpler capture through a second KKL cable.
 
+## MCP server (Claude reads the ECU)
+
+`mcp_server.py` exposes the same read-only access as an MCP server (stdio) for Claude Desktop / Claude Code:
+connect, read PIDs, dumps and diffs, recordings, analysis and a separate per-car PID profile.
+C0–FC and fault code erase are not reachable through it. Setup and a PID-mapping routine (in Russian):
+[README_MCP.md](README_MCP.md). Tests on the simulator: `python -m pytest tests`.
+
 ## kkl_probe quick reference
 
 ```
