@@ -57,6 +57,7 @@ def test_connect_status(car):
     assert st["ecu_id"] == "E4B3"
     assert st["init"].startswith("MUT-II 0x00")
     assert "simulator" in st["iface"]
+    assert st["fd"] is None and "warning" not in st  # the simulator does not answer FD
 
 
 def test_one_session_at_a_time(car):
@@ -137,6 +138,7 @@ def test_mutdump_and_diff(car):
     assert a["answered"] == 194  # the simulator does not answer FD
     assert a["file"].startswith("sim/") and "cold-engine-off" in a["file"]
     assert len(a["hex_grid"]) == 13
+    assert a["pairs_16bit"]["29+2A"] == sim_value(0x29) * 256 + sim_value(0x2A) and "80+81" in a["pairs_16bit"]
     path = car.logroot / a["file"]
     rec = json.loads(path.read_text(encoding="utf-8"))
     assert rec["note"] == "cold engine off" and rec["ecu_id"] == "E4B3"
@@ -213,12 +215,62 @@ def test_record_and_analyze(car):
     assert not any(f.endswith(".meta.json") for f in kinds)
 
 
+def sim_value(pid):
+    return (pid * 37 + 11) & 0xFF  # kkl/sim.py 'mutlive' answer for PIDs without a model
+
+
 def test_dtc_read(car):
     r = car.dtc_read()
-    for kind in ("active", "stored"):
-        assert len(r[kind]["raw"]) == 2 and None not in r[kind]["raw"]
-        assert isinstance(r[kind]["bits"], list)
-    assert "hypothesis" in r["note"]
+    assert len(r["raw"]) == 19 and set(r["raw"]) >= {"36", "38", "3B", "40", "45", "47", "4D"}
+    assert r["raw"]["47"] == sim_value(0x47)
+    assert set(r["layouts"]) == set(m.DTC_LAYOUTS)
+    for layout in r["layouts"].values():
+        for e in layout.values():
+            assert len(e["raw"]) == 2 and set(e["codes"]) == set(m.DTC_ORDERS)
+            assert all(len(c) == len(e["bits"]) for c in e["codes"].values())
+    assert "unknown" in r["note"]
+
+
+def test_hypotheses(car):
+    n = sum(1 for line in m.HYPOTHESES.read_text(encoding="utf-8-sig").splitlines()
+            if line.strip() and not line.startswith("#"))
+    assert len(car.hyp) == n  # every line of the file is valid
+    assert all(0xC0 > p or p >= 0xFD for p in car.hyp)
+    v = {x["pid"]: x for x in car.read_pids(["10", "29"])["values"]}
+    assert "2A" not in v  # the low byte is read, but not listed as its own value
+    h = v["29"]["hypothesis"]
+    raw16 = v["29"]["raw"] * 256 + sim_value(0x2A)
+    assert h["pair"] == "29+2A" and h["raw16"] == raw16 and float(h["value"]) == round(raw16 / 1000, 2)
+    assert "not confirmed" in h["status"] and h["expected"] == "1.7-2.9"
+    assert v["10"]["hypothesis"]["value"] == str(v["10"]["raw"] - 40)
+    g = car.defs_get("29")
+    assert g["hypothesis"]["source"] == "E, M, L" and "value" not in g["hypothesis"]
+
+
+def test_init_order():
+    assert m.init_order("auto") == ["mut", "obd", "mut01"]
+    assert m.init_order("auto", "mut01") == ["mut01", "mut", "obd"]
+    assert m.init_order("obd") == ["obd"]
+    assert m.INIT_METHODS["mut01"]["addr"] == 0x01
+
+
+def test_mut01_no_dump(car):
+    car.init_method = "mut01"
+    try:
+        assert "A/T" in car.status()["warning"]
+        with pytest.raises(RuntimeError, match="A/T control unit"):
+            car.mutdump("x")
+        car.read_pids(["FE"])  # single reads still work
+    finally:
+        car.init_method = "mut"
+
+
+@pytest.mark.parametrize("model, hint", [("dead", "does not hear"), ("none", "echo OK")])
+def test_connect_failure_says_cable_or_ecu(tmp_path, model, hint):
+    c = m.Car(f"sim:{model}", logdir=tmp_path / "logs", profile=tmp_path / "colt.csv")
+    with pytest.raises(RuntimeError, match=hint):
+        c.connect("mut", rounds=1)
+    assert not c.status()["connected"]  # port released after the failed attempt
 
 
 def test_defs_only_touch_colt_profile(car):

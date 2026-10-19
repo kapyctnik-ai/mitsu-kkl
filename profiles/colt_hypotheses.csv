@@ -1,0 +1,58 @@
+# Hypotheses for the Colt CJ4A 1999 4G92 engine ECU MD353925: NOT confirmed on this car.
+# Read-only for mcp_server.py (shown next to values as 'hypothesis'); confirmed results go to colt_cj4a_md353925.csv.
+# pid ; pair ; name ; conversion ; unit ; expected ; source
+# pair: second request with the low byte; the conversion then gets x = 256*pid + pair.
+# bit names give the mask (0x80 = bit 7); conversion 'bin' shows the 8 bits.
+# expected: warm engine at idle (80-95 C, N/P, A/C off) unless said otherwise.
+# sources: E = EvoEcu MUT_Requests (Evo, 2013); S = EvoScan 'MUTII EFI' (1998+ notes); M = MMCd (1990-94 DSM, 1953 baud);
+#   L = Lancer '99 workshop manual 13A <4G9> (search excerpts, not read in full); A = mitsu-kkl Eclipse 4G63 E4 3A (tested there)
+00 ;  ; flags: 0x80 throttle closed (A), 0x20 A/C clutch (M) ; bin ;  ;  ; A, M
+02 ;  ; flags: 0x80 idle switch, 0x20 park/neutral, 0x10 A/C switch, 0x08 power steering, 0x04 TDC ; bin ;  ;  ; M (1990-94)
+04 ;  ; ignition timing (interpolated) ; x-20 ; ° ;  ; E
+06 ;  ; ignition timing ; x-20 ; ° ; 5 with the timing adjustment connector grounded ; E, S (x-10 on 1990-94, M)
+07 ;  ; coolant temp, raw NTC ADC (falls when hot) ;  ;  ; ~240 when open circuit ; A
+10 ;  ; coolant temp ; x-40 ; °C ; 80-95 ; E, S, L
+11 ;  ; intake air temp ; x-40 ; °C ; about ambient ; E, S
+13 ;  ; front O2 sensor (none on this car) ; x*0.01952 ; V ; constant ; E, M
+14 ;  ; battery voltage ; x*0.0733 ; V ; 13.5-14.5 engine running ; E, M, A
+15 ;  ; barometric pressure ; x*0.49 ; kPa ; 95-103 ; E, M
+16 ;  ; ISC steps ; x ; steps ; 2-25 ; E, L
+17 ;  ; throttle position ; x*100/255 ; % ; closed: raw ~27-37 (0.535-0.735 V) ; E, L
+18 ;  ; open loop bit array ; bin ;  ; constant? (no O2 sensor) ; E
+1A ;  ; air flow (Karman vortex) ; x*6.25 ; Hz ; 25-51, 80-120 at 2500 rpm ; E, M, L
+1C ;  ; engine load ; x*5/8 ;  ;  ; E, S
+21 ;  ; engine speed ; x*31.25 ; rpm ; 700-800 ; E, M, L
+24 ;  ; target idle speed ; x*7.8 ; rpm ; ~750 ; E, S
+25 ;  ; idle stepper value ; x ;  ;  ; E
+26 ;  ; knock sum (only if a knock sensor is fitted) ; x ;  ; 0 at idle ; E, S
+29 ; 2A ; injector pulse width (29 high + 2A low byte) ; x/1000 ; ms ; 1.7-2.9 ; E, M, L
+2F ;  ; vehicle speed ; x*2 ; km/h ; 0 standing ; E, S
+36 ;  ; active fault count ; x ;  ; 0 ; E
+37 ;  ; stored fault count ; x ;  ;  ; E
+38 ;  ; active faults low byte (1990-94) ; bin ;  ;  ; M
+39 ;  ; active faults high byte (1990-94) ; bin ;  ;  ; M
+3A ;  ; intake air temp, raw ADC ;  ;  ; ~240 when open circuit ; A
+3B ;  ; stored faults low byte (1990-94) ; bin ;  ;  ; M
+3C ;  ; stored faults high byte (1990-94) ; bin ;  ;  ; M
+40 ;  ; faults low byte: stored (E) / active (A) ; bin ;  ;  ; E, A
+41 ;  ; faults high byte: stored (E) / active (A) ; bin ;  ;  ; E, A
+45 ;  ; faults: stored hi 2 (E) / stored low byte (A) ; bin ;  ;  ; E, A
+46 ;  ; faults: stored high byte (A) ; bin ;  ;  ; A
+47 ;  ; active faults low byte ; bin ;  ;  ; E
+48 ;  ; active faults high byte ; bin ;  ;  ; E
+49 ;  ; flags: 0x04 A/C relay ; bin ;  ;  ; E, S
+71 ;  ; sensor error flags ; bin ;  ;  ; E, A
+79 ;  ; injector latency (depends on battery voltage) ; x ;  ;  ; E
+80 ; 81 ; ECU ID type ;  ;  ;  ; E
+82 ;  ; ECU ID version ;  ;  ;  ; E
+84 ;  ; radiator fan duty ;  ; % ;  ; E
+9A ;  ; flags: 0x01 A/C clutch ; bin ;  ;  ; E
+A2 ;  ; flags: 0x01 crank pulse, 0x02 air flow sensor pulse, 0x04 cam pulse ; bin ;  ; flicker with engine running ; E
+A8 ;  ; flags: 0x01/0x02 A/T input/output shaft pulse, 0x20 gear L, 0x40 gear 2, 0x80 gear 3 ; bin ;  ;  ; E
+AA ;  ; flags: 0x10 brake pressed ; bin ;  ;  ; E
+B3 ;  ; flags: 0x01 neutral, 0x02 drive ; bin ;  ;  ; E
+B4 ;  ; flags: 0x40 park, 0x80 reverse ; bin ;  ;  ; E
+B8 ;  ; flags: 0x01 A/C switch, 0x04 power steering ; bin ;  ;  ; E
+FD ;  ; init handshake byte ;  ;  ; 0x20 (32) ; E
+FE ;  ; ECU ID high byte ;  ;  ;  ; E, A
+FF ;  ; ECU ID low byte ;  ;  ;  ; E, A

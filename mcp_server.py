@@ -47,6 +47,7 @@ from kkl.log import RunLog
 HERE = Path(__file__).resolve().parent
 PROFILE_DEFAULT = HERE / "profiles" / "colt_cj4a_md353925.csv"
 REFERENCE_DEFS = HERE / "pid_definicje.csv"  # Eclipse 4G63, ECU E4 3A: a hint, never the truth for this car
+HYPOTHESES = HERE / "profiles" / "colt_hypotheses.csv"  # read-only: names, conversions, expected values, sources
 PROTECTED = {HERE / n for n in ("pid_definicje.csv", "pid_definitions.csv", "dtc_definitions.csv",
                                 "pid_profiles.csv")}
 ANALYZER = HERE / "tools" / "analyze_readings.py"
@@ -61,9 +62,25 @@ DUMP_PIDS = sorted(READ_ONLY)
 KEEPALIVE_S = 2.0  # FE request when idle; the ECU drops the session after ~10-15 s without one
 STALE_S = 8.0      # session idle longer than this is checked (and re-initialised) before use
 MAX_PIDS, MAX_SAMPLES = 64, 500
-DTC_PIDS = {"active": (0x40, 0x41), "stored": (0x45, 0x46)}
-NO_ANSWER_HINT = ("check: ignition ON, OBD pin 1 grounded (jumper to pin 4), cable switch on K-line (7), "
-                  "selftest OK")
+# Init methods: proto's MUT-II 0x00 and OBD-II 0x33, plus 5-baud 0x01, which wakes the engine ECU on some cars
+# (EvoEcu MUT_Protocol) but may be the A/T control unit on others: no full dump there until the IDs are compared.
+INIT_METHODS = {**proto.INIT_METHODS,
+                "mut01": {"addr": 0x01, "baud": 15625, "ack": False, "label": "MUT-II 0x01 @ 15625"}}
+INIT_MODES = ("auto", *INIT_METHODS)
+MAYBE_TCU = "mut01"
+# Fault code bytes differ between ECU generations; on MD353925 all of these are candidates.
+DTC_CANDIDATES = (0x36, 0x37, 0x38, 0x39, 0x3B, 0x3C, *range(0x40, 0x49), *range(0x4A, 0x4E))
+DTC_LAYOUTS = {
+    "mitsu-kkl Eclipse E4 3A": {"active": (0x40, 0x41), "stored": (0x45, 0x46)},
+    "EvoEcu": {"active": (0x47, 0x48), "stored": (0x40, 0x41)},
+    "MMCd 1990-94": {"active": (0x38, 0x39), "stored": (0x3B, 0x3C)},
+}
+DTC_ORDERS = {"mitsu-kkl": proto.DTC_CODES,
+              "classic (MMCd/EvoScan)": (11, 12, 13, 14, 15, 21, 22, 23, 24, 25, 31, 41, 42, 43, 44, 36)}
+NO_ECHO_HINT = ("the cable does not hear its own K-line echo: no power from OBD pin 16, switch not on K-line (7) "
+                "or wrong interface; run selftest")
+SILENT_HINT = ("the cable works (echo OK) but the ECU did not answer: ignition ON? OBD pin 1 grounded (jumper to "
+               "pin 4)? then try init mut01")
 
 PROFILE_HEADER = (
     "# Mitsubishi Colt CJ4A 1999, 4G92 1.6 SOHC, automatic, engine ECU MD353925, no O2 sensor (open loop).",
@@ -90,6 +107,40 @@ def parse_pid(text):
     pid = int(s, 16)
     check_read(pid)
     return pid
+
+
+def init_order(mode, last_good=None):
+    """Methods to try, in order; 'auto' tries all, the one that worked last first."""
+    if mode in INIT_METHODS:
+        return [mode]
+    order = list(INIT_METHODS)
+    if last_good in order:
+        order.remove(last_good)
+        order.insert(0, last_good)
+    return order
+
+
+def load_hypotheses(path):
+    """colt_hypotheses.csv -> {pid: {pair, name, conversion, unit, expected, source, fn}}; bad lines are skipped."""
+    out = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        f = [x.strip() for x in line.split(";")] + [""] * 7
+        try:
+            pid, pair = int(f[0], 16), int(f[1], 16) if f[1] else None
+            check_read(pid)
+            if pair is not None:
+                check_read(pair)
+            fn = piddefs.compile_conversion(f[3])
+        except ValueError:
+            continue
+        out[pid] = {"pair": pair, "name": f[2], "conversion": f[3], "unit": f[4], "expected": f[5],
+                    "source": f[6], "fn": fn}
+    return out
 
 
 def hx(pid):
@@ -129,8 +180,10 @@ class GuardedDevice:
 class Car:
     """The one cable session of this server. Every K-line exchange holds self.lock."""
 
-    def __init__(self, iface=AUTO, init="auto", logdir=None, profile=None, keepalive=KEEPALIVE_S):
+    def __init__(self, iface=AUTO, init="auto", logdir=None, profile=None, keepalive=KEEPALIVE_S,
+                 hypotheses=HYPOTHESES):
         self.iface_default, self.init_default = iface, init
+        self.hyp = load_hypotheses(Path(hypotheses))
         self.logroot = Path(logdir).resolve() if logdir else HERE / "logs"
         self.profile = Path(profile).resolve() if profile else PROFILE_DEFAULT
         if self.profile in PROTECTED:
@@ -146,6 +199,7 @@ class Car:
     def _reset(self):
         self.kl = self.dev = self.runlog = None
         self.iface_key = self.iface = self.ecu_id = self.init_label = self.last_good = None
+        self.init_method = self.fd = None
         self.alive, self.last_ok, self.reinits, self.connected_at = False, 0.0, 0, None
 
     # -- files ---------------------------------------------------------------------------
@@ -171,8 +225,8 @@ class Car:
     # -- connection ------------------------------------------------------------------------
     def connect(self, init=None, iface=None, rounds=3):
         init = init or self.init_default
-        if init not in proto.INIT_MODES:
-            raise ValueError(f"init must be one of {', '.join(proto.INIT_MODES)}")
+        if init not in INIT_MODES:
+            raise ValueError(f"init must be one of {', '.join(INIT_MODES)}")
         with self.lock:
             if self.kl:
                 raise RuntimeError(f"already connected ({self.iface}); disconnect first")
@@ -189,6 +243,7 @@ class Car:
             except Exception:
                 self._close()
                 raise
+            self.fd = self._query(0xFD)  # 0x20 on Evo ECUs (EvoEcu MUT_Protocol): one more identity byte
             self.connected_at = time.time()
             self.stop_ev.clear()
             if self.keepalive_s > 0:
@@ -197,26 +252,29 @@ class Car:
             return self.status()
 
     def _init_session(self, rounds):
-        """5-baud init through proto.connect, methods in proto.init_order (auto: 0x00 and 0x33
-        in turn, the one that worked last first). Raises when the ECU stays silent."""
-        self.alive, tried = False, []
+        """5-baud init (proto.mut with the parameters of INIT_METHODS, as proto.connect does), methods
+        from init_order. Raises when the ECU stays silent, telling a deaf cable from a silent ECU."""
+        self.alive, tried, echo = False, [], False
         self.kl.log = self.runlog  # byte-level log of the init only; polling would flood it
         try:
             for r in range(rounds):
-                for method in proto.init_order(self.init_mode, self.last_good):
+                for method in init_order(self.init_mode, self.last_good):
+                    p = INIT_METHODS[method]
                     params = {"method": method, "round": r}
                     self.runlog.begin(len(tried) + 1, "connect", params)
-                    self.dev.ack_budget = 1 if proto.INIT_METHODS[method]["ack"] else 0
+                    self.dev.ack_budget = 1 if p["ack"] else 0
                     try:
-                        res = proto.connect(self.kl, self.runlog, method)
+                        res = proto.mut(self.kl, self.runlog, addr=p["addr"], baud=p["baud"], ack=p["ack"],
+                                        queries=proto.MUT_ID_QUERIES, require_ack=p["ack"])
                     finally:
                         self.dev.ack_budget = 0
                     self.runlog.end("connect", params, res)
-                    label = proto.INIT_METHODS[method]["label"]
-                    tried.append(f"{label}: {res['outcome']}")
+                    # our own break comes back through the transceiver: proof that the cable hears the K-line
+                    echo = echo or bool(res.get("loopback")) or res.get("alive_before", "-") != "-"
+                    tried.append(f"{p['label']}: {res['outcome']}")
                     if res["outcome"] == "DATA":
                         self.ecu_id = "".join(q["resp"] for q in res["queries"])
-                        self.init_label, self.last_good = label, method
+                        self.init_label, self.init_method, self.last_good = p["label"], method, method
                         self.alive, self.last_ok = True, now()
                         return
                     self.kl.sleep(0.3)
@@ -224,7 +282,8 @@ class Car:
                     self.kl.sleep(2.0)
         finally:
             self.kl.log = NullLog()
-        raise RuntimeError("ECU did not answer (" + "; ".join(tried) + "). " + NO_ANSWER_HINT)
+        raise RuntimeError("ECU did not answer (" + "; ".join(tried) + "). "
+                           + (SILENT_HINT if echo else NO_ECHO_HINT))
 
     def _require(self):
         if not self.kl:
@@ -306,9 +365,13 @@ class Car:
     def status(self):
         with self.lock:
             st = {"connected": self.kl is not None, "session_alive": self.alive, "iface": self.iface,
-                  "init": self.init_label, "ecu_id": self.ecu_id, "reinits": self.reinits,
+                  "init": self.init_label, "ecu_id": self.ecu_id,
+                  "fd": None if self.fd is None else f"{self.fd:02X}", "reinits": self.reinits,
                   "idle_s": round(now() - self.last_ok, 1) if self.kl else None,
                   "connected_for_s": round(time.time() - self.connected_at) if self.connected_at else None}
+        if self.init_method == MAYBE_TCU:
+            st["warning"] = ("connected through 5-baud 0x01: this may be the A/T control unit, not the engine ECU; "
+                             "compare its ID with the 0x00 answer before mapping anything")
         rec = self.rec
         st["recording"] = rec.info() if rec else None
         st.update(profile=str(self.profile), logs=str(self.logroot), version=__version__,
@@ -380,19 +443,41 @@ class Car:
         except ValueError:
             return None
 
+    def _hyp(self, pid, vals=None):
+        """The hypothesis for `pid` (colt_hypotheses.csv), evaluated on `vals` when given; a pair
+        (e.g. 29+2A) is converted as the 16-bit value 256*high + low."""
+        h = self.hyp.get(pid)
+        if not h:
+            return None
+        out = {k: h[k] for k in ("name", "conversion", "unit", "expected", "source") if h[k]}
+        out["status"] = "hypothesis, not confirmed on MD353925"
+        if h["pair"] is not None:
+            out["pair"] = f"{hx(pid)}+{hx(h['pair'])}"
+        if vals is not None:
+            x = vals.get(pid)
+            if h["pair"] is not None:
+                lo = vals.get(h["pair"])
+                x = out["raw16"] = None if x is None or lo is None else x * 256 + lo
+            if x is not None and h["fn"]:
+                out["value"] = h["fn"](x)
+        return out
+
     def defs_get(self, pid=None):
         defs, _ = self._defs()
         if pid is not None:
             p = parse_pid(pid)
             out = self._meta(p, defs)
+            h = self._hyp(p)
+            if h:
+                out["hypothesis"] = h
             r = self._reference().get(p)
             if r and (r.name or r.conv):
                 out["eclipse_reference"] = {"name": r.name, "conversion": r.conv, "unit": r.unit,
                                             "status": "hypothesis only (Eclipse 4G63, ECU E4 3A)"}
             return out
         rows = [self._meta(p, defs) for p, d in sorted(defs.items()) if d.name or d.conv or d.unit]
-        return {"profile": str(self.profile), "defined": rows,
-                "note": "only this car's profile; ask for one PID to see the Eclipse hint"}
+        return {"profile": str(self.profile), "defined": rows, "hypotheses": len(self.hyp),
+                "note": "only this car's profile; ask for one PID to see the hypothesis and the Eclipse hint"}
 
     def defs_set(self, pid, name, conversion="", unit="", confirmed=False, evidence=""):
         p = parse_pid(pid)
@@ -442,11 +527,13 @@ class Car:
         if not 1 <= samples <= MAX_SAMPLES:
             raise ValueError(f"samples must be 1-{MAX_SAMPLES}")
         defs, _ = self._defs()
-        series, ts, t0 = {p: [] for p in plist}, [], time.time()
+        partners = [h["pair"] for p in plist if (h := self.hyp.get(p)) and h["pair"] is not None]
+        reads = plist + [q for q in dict.fromkeys(partners) if q not in plist]  # low bytes of 16-bit pairs
+        series, ts, t0 = {p: [] for p in reads}, [], time.time()
         for i in range(samples):
-            vals = self._read(plist)
+            vals = self._read(reads)
             ts.append(round(time.time() - t0, 3))
-            for p in plist:
+            for p in reads:
                 series[p].append(vals[p])
             if interval_ms > 0 and i + 1 < samples:
                 time.sleep(min(interval_ms, 60000) / 1000)  # outside the lock: keep-alive / recording go on
@@ -461,6 +548,9 @@ class Car:
             if samples > 1:
                 row.update(series=vs, min=min(good, default=None), max=max(good, default=None),
                            mean=round(statistics.fmean(good), 2) if good else None)
+            h = self._hyp(p, {q: s[-1] for q, s in series.items()})
+            if h:
+                row["hypothesis"] = h
             rows.append(row)
         out = {"ecu_id": self.ecu_id, "samples": samples, "values": rows}
         if samples > 1:
@@ -468,6 +558,9 @@ class Car:
         return out
 
     def mutdump(self, note=""):
+        if self.init_method == MAYBE_TCU:
+            raise RuntimeError("connected through 0x01, which may be the A/T control unit: no full dump until its ID "
+                               "is compared with the 0x00 answer; read single requests with read_pids")
         vals = self._read(DUMP_PIDS)
         path = self.logdir() / f"{stamp()}_mutdump_mcp{'_' + slug(note) if slug(note) else ''}.json"
         rec = {"kind": "mcp_mutdump", "wall": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -481,7 +574,9 @@ class Car:
                 grid.append(f"{row:02X}: " + " ".join("  " if c == "" else "--" if c is None else f"{c:02X}"
                                                      for c in cells))
         answered = sum(v is not None for v in vals.values())
-        return {"file": self.rel(path), "answered": answered, "of": len(vals), "hex_grid": grid,
+        pairs = {f"{hx(p)}+{hx(h['pair'])}": self._hyp(p, vals).get("raw16")
+                 for p, h in self.hyp.items() if h["pair"] is not None}
+        return {"file": self.rel(path), "answered": answered, "of": len(vals), "hex_grid": grid, "pairs_16bit": pairs,
                 "legend": "row = high nibble, column = low nibble; -- no answer, blank = not requested"}
 
     @staticmethod
@@ -527,21 +622,24 @@ class Car:
                 "changed": changed, "answer_changed": lost, "unchanged": same}
 
     def dtc_read(self):
-        vals = self._read([p for pair in DTC_PIDS.values() for p in pair])
-        out = {}
-        for kind, (lo, hi) in DTC_PIDS.items():
-            a, b = vals[lo], vals[hi]
-            e = {"pids": f"{hx(lo)}/{hx(hi)}", "raw": [a, b]}
-            if a is None or b is None:
-                e["error"] = "no answer"
-            else:
-                e["bits"] = [i for i in range(16) if (a | b << 8) >> i & 1]
-                e["codes_hypothesis"] = dtcdefs.decode(a, 0) + dtcdefs.decode(b, 8)
-            out[kind] = e
-        out["note"] = ("PIDs 40/41 (active), 45/46 (stored) and the bit -> code order come from the Eclipse "
-                       "ECU E4 3A: a hypothesis on MD353925 until confirmed (unplug one sensor, compare, count "
-                       "check-engine blinks with pin 1 grounded). Fault code erase is not available here.")
-        return out
+        """Every fault code byte candidate, decoded per source layout and bit order (all hypotheses)."""
+        vals = self._read(list(DTC_CANDIDATES))
+        layouts = {}
+        for src, kinds in DTC_LAYOUTS.items():
+            layouts[src] = {}
+            for kind, (lo, hi) in kinds.items():
+                a, b = vals[lo], vals[hi]
+                e = {"pids": f"{hx(lo)}/{hx(hi)}", "raw": [a, b]}
+                if a is None or b is None:
+                    e["error"] = "no answer"
+                else:
+                    e["bits"] = [i for i in range(16) if (a | b << 8) >> i & 1]
+                    e["codes"] = {o: [dtcdefs.label(order[i]) for i in e["bits"]] for o, order in DTC_ORDERS.items()}
+                layouts[src][kind] = e
+        return {"raw": {hx(p): v for p, v in vals.items()}, "layouts": layouts,
+                "note": ("which bytes hold the codes on MD353925 and the bit -> code order are unknown: unplug one "
+                         "sensor (ignition off), compare dtc_read before/after and count check-engine blinks with "
+                         "pin 1 grounded. Fault code erase is not available here.")}
 
     # -- recording -----------------------------------------------------------------------------
     def record_start(self, pids, note="", interval_ms=0, max_minutes=60):
@@ -667,7 +765,8 @@ INSTRUCTIONS = """\
 MUT-II diagnostics of a Mitsubishi engine ECU over a VAG KKL (FTDI) cable. Car: Mitsubishi Colt CJ4A 1999,
 4G92 1.6 SOHC, automatic, engine ECU MD353925, no O2 sensor (open loop). There is no known PID map for this
 ECU: we build it from this car's logs. Names from the Eclipse 4G63 map (ECU E4 3A, defs_get 'eclipse_reference')
-are hypotheses only. Never present a PID meaning as fact unless a logged test confirmed it; save unconfirmed
+are hypotheses only, as are the entries of profiles/colt_hypotheses.csv shown as 'hypothesis' next to values
+(EvoEcu, EvoScan, MMCd, Lancer '99 manual excerpts, with expected warm-idle values). Never present a PID meaning as fact unless a logged test confirmed it; save unconfirmed
 meanings with defs_set(confirmed=false) and give evidence (file, time, values) for every defs_set.
 Typical flow: selftest -> connect -> read_pids / mutdump -> change ONE thing on the car -> mutdump -> diff_dumps;
 record_start/record_stop for events, then analyze. Read-only: MUT 00-BF and FD-FF; C0-FC is blocked and
@@ -706,11 +805,13 @@ def build_server(car):
         return car.selftest(iface or None)
 
     @tool
-    def connect(init: Literal["auto", "mut00", "obd33"] = "auto", iface: str = "") -> dict:
-        """Open the MUT-II session with the engine ECU (ignition ON, pin 1 grounded). init: auto = try 0x00 then 0x33,
-        mut00 = 5-baud 0x00 @ 15625, obd33 = ISO 9141-2 0x33 @ 10400. Only one session at a time. The session is
-        kept alive and re-initialised automatically if the ECU drops it."""
-        return car.connect({"auto": "auto", "mut00": "mut", "obd33": "obd"}[init], iface or None)
+    def connect(init: Literal["auto", "mut00", "obd33", "mut01"] = "auto", iface: str = "") -> dict:
+        """Open the MUT-II session with the engine ECU (ignition ON, pin 1 grounded). init: auto = try 0x00, 0x33,
+        0x01 in turn; mut00 = 5-baud 0x00 @ 15625; obd33 = ISO 9141-2 0x33 @ 10400; mut01 = 5-baud 0x01 @ 15625
+        (engine ECU on some cars, possibly the A/T unit on others: status warns, mutdump refuses). Only one session
+        at a time; kept alive and re-initialised automatically if the ECU drops it. On failure the error says
+        whether the cable heard its own echo (cable problem) or the ECU stayed silent."""
+        return car.connect({"auto": "auto", "mut00": "mut", "obd33": "obd", "mut01": "mut01"}[init], iface or None)
 
     @tool
     def disconnect() -> dict:
@@ -726,7 +827,8 @@ def build_server(car):
     def read_pids(pids: list[str], samples: int = 1, interval_ms: int = 0) -> dict:
         """Read MUT PIDs (hex strings like '07', '21'; only 00-BF and FD-FF). samples > 1 polls repeatedly
         (interval_ms between passes) and returns series with min/max/mean. Each value carries the name, conversion
-        and status (confirmed / hypothesis / unknown) from this car's profile."""
+        and status (confirmed / hypothesis / unknown) from this car's profile, plus 'hypothesis' from
+        colt_hypotheses.csv (name, value, expected range, source); 16-bit pairs such as 29+2A are read together."""
         return car.read_pids(pids, samples, interval_ms)
 
     @tool
@@ -761,8 +863,8 @@ def build_server(car):
 
     @tool
     def dtc_read() -> dict:
-        """Read the fault code bytes (40/41 active, 45/46 stored). The PID and bit mapping come from the Eclipse
-        and are a hypothesis on this ECU. Erasing fault codes is deliberately not available."""
+        """Read every fault code byte candidate (36-39, 3B, 3C, 40-48, 4A-4D) and decode them per source layout
+        (Eclipse, EvoEcu, MMCd) and bit order: all hypotheses on this ECU. Erasing fault codes is not available."""
         return car.dtc_read()
 
     @tool
@@ -790,7 +892,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--iface", default=os.environ.get("MITSU_KKL_IFACE", AUTO),
                     help="auto | d2xx:#0 | d2xx:<serial> | serial:COM5 | sim:mutlive (default auto)")
-    ap.add_argument("--init", choices=proto.INIT_MODES, default="auto", help="default init for connect")
+    ap.add_argument("--init", choices=INIT_MODES, default="auto", help="default init for connect")
     ap.add_argument("--logdir", help="default: logs/ next to this file")
     ap.add_argument("--profile", help=f"PID profile of this car (default {PROFILE_DEFAULT.relative_to(HERE)})")
     args = ap.parse_args(argv)
