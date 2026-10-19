@@ -1,0 +1,7 @@
+﻿# MUT-II PID definitions (engine ECU). Separator: semicolon. Lines starting with # are comments.
+# pid ; name ; conversion ; unit ; on list (1/0)
+# conversion: expression in x (raw byte 0-255), e.g. x*0.0733 | x*31.25 | x-40 | (x>>4)&15 | round(x*0.49, 1)
+#   or a keyword: dtc / dtc2 (fault code bits), bin (binary); empty = no conversion
+# Mitsubishi Colt CJ4A 1999, 4G92 1.6 SOHC, automatic, engine ECU MD353925, no O2 sensor (open loop).
+# Built only from logs of this car. A name ending in '?' is a hypothesis; without '?' it was confirmed
+# by a test (evidence in colt_cj4a_md353925_notes.md). Written by mcp_server.py (defs_set).

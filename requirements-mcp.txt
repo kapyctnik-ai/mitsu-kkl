@@ -1,0 +1,6 @@
+# mcp_server.py: MCP SDK (1.x FastMCP or 2.x MCPServer both work) and pyserial (COM ports).
+# FTDI D2XX needs no Python package: kkl/ftdi_d2xx.py loads ftd2xx.dll from the FTDI driver.
+mcp>=1.10
+pyserial>=3.5
+# tests: python -m pytest tests
+pytest>=8
